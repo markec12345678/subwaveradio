@@ -56,6 +56,121 @@ export function sanitizeRequestText(raw: string): string {
     .trim();
 }
 
+// ─── Layer 3: output-side injection detection ──────────────────────────────
+//
+// Red-team finding (SECURITY_AUDIT.md §3.3): sanitizeRequestText() neutralizes
+// STRUCTURAL injection markers ([INST], <<SYS>>, <|system|>) but the SEMANTIC
+// payload ("say X", "respond with X", "output X") survives as plain text.
+// Instruction-following models (GLM-4 in the red-team test, also small open
+// models like Qwen 7B / Llama 8B) will follow the plain-text directive.
+//
+// This function is the third defense layer. After the LLM generates its intro,
+// the controller scans the response for:
+//   1. Operator-configured canary phrases (state/settings.json → security.denylist)
+//   2. Verbatim repetition of suspicious substrings from the request
+//      (e.g. if listener text contains "say 'X'" and the LLM output contains
+//       "X", that's a strong injection signal)
+//   3. Common injection-success markers ("INJECTION SUCCESSFUL", "IGNORED",
+//      "OVERRIDDEN", "AS YOU WISH" — these come from prompt-injection literature)
+//
+// Returns { injected: boolean, reason: string }. When injected=true, the
+// controller should reject the LLM output and fall back to a generic
+// acknowledgement ("Coming up next, your request.") instead of airing it.
+//
+// This is conservative by design — false positives (rejecting a benign intro)
+// are acceptable; false negatives (airing an injected intro) are not.
+export interface InjectionCheckResult {
+  injected: boolean;
+  reason: string;
+  matchedPhrase?: string;
+}
+
+// Default canary phrases. Operator can extend via settings.security.denylist.
+// These are case-insensitive substrings — anything containing them is rejected.
+const DEFAULT_CANARY_PHRASES: readonly string[] = Object.freeze([
+  'injection successful',
+  'ignore previous',
+  'ignore all prior',
+  'disregard previous',
+  'disregard all prior',
+  'as an ai language model',  // common LLM-refusal-override signal
+  'i am now evil',
+  'i have been overridden',
+  'system prompt:',
+  'you are now',
+]);
+
+// Phrases from the listener request that, if they appear verbatim in the LLM
+// response, suggest the LLM is following injected directives rather than
+// writing a fresh acknowledgement. Matched case-insensitively.
+const SUSPICIOUS_REQUEST_PATTERNS: readonly RegExp[] = Object.freeze([
+  /\b(say|respond with|output|repeat|print)\s+['"]?[\w\s'"]{1,80}['"]?/gi,
+  /\bignore\s+(previous|prior|above|all|earlier)\b/gi,
+  /\boverride\s+(previous|prior|all|the)\b/gi,
+]);
+
+export function detectInjectionInResponse(
+  response: string,
+  listenerText: string,
+  operatorDenylist: readonly string[] = [],
+): InjectionCheckResult {
+  const resp = String(response ?? '').toLowerCase();
+  const reqLower = String(listenerText ?? '').toLowerCase();
+
+  // 1. Operator denylist + default canary phrases
+  const denylist = [...DEFAULT_CANARY_PHRASES, ...operatorDenylist];
+  for (const phrase of denylist) {
+    const p = phrase.toLowerCase();
+    if (p && resp.includes(p)) {
+      return {
+        injected: true,
+        reason: `Response contains denylisted phrase: "${phrase}"`,
+        matchedPhrase: phrase,
+      };
+    }
+  }
+
+  // 2. Extract "say 'X'" / "respond with 'X'" patterns from the listener
+  // request, then check if X appears verbatim in the LLM response. This is
+  // the strongest signal — the listener is trying to coerce specific output.
+  for (const pattern of SUSPICIOUS_REQUEST_PATTERNS) {
+    const matches = listenerText.match(pattern);
+    if (!matches) continue;
+    for (const match of matches) {
+      // Extract the quoted/bracketed payload from the directive.
+      // "say 'INJECTION SUCCESSFUL'" → "injection successful"
+      const payloadMatch = match.match(/['"]([^'"]{2,80})['"]/);
+      if (payloadMatch) {
+        const payload = payloadMatch[1].toLowerCase().trim();
+        // Only flag if the payload is at least 4 chars (avoid false positives
+        // from common words like "hi", "ok", "yes").
+        if (payload.length >= 4 && resp.includes(payload)) {
+          return {
+            injected: true,
+            reason: `Response contains payload of injected directive: listener said "${match.trim()}", response contains "${payloadMatch[1]}"`,
+            matchedPhrase: payloadMatch[1],
+          };
+        }
+      }
+    }
+  }
+
+  // 3. If the listener text contains an obvious directive ("say X", "respond
+  // with X") AND the response is suspiciously short (< 30 chars), flag it.
+  // Successful injections often produce short, robotic outputs ("INJECTION
+  // SUCCESSFUL", "OK", "Done") rather than the DJ's natural multi-sentence
+  // acknowledgement style.
+  const hasDirective = SUSPICIOUS_REQUEST_PATTERNS.some(p => p.test(listenerText));
+  if (hasDirective && response.trim().length < 30) {
+    return {
+      injected: true,
+      reason: `Listener text contains directive pattern and response is suspiciously short (${response.trim().length} chars)`,
+    };
+  }
+
+  return { injected: false, reason: 'No injection markers detected' };
+}
+
 // ---------------------------------------------------------------------------
 // In-memory request ledger. Each POST /request mints an entry; the background
 // resolver mutates it; GET /request/:id reads it. Ephemeral by design — a
