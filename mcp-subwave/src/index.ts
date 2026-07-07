@@ -13,6 +13,13 @@
  *                       prod behind Caddy is http://localhost:7700/api)
  *   SUBWAVE_ADMIN_USER  admin Basic-auth user  — required for DJ control tools
  *   SUBWAVE_ADMIN_PASS  admin Basic-auth pass  — required for DJ control tools
+ *
+ * Security: admin tools (subwave_dj_announce, subwave_dj_segment) are rate-
+ * limited at this layer in addition to the controller's own rate limits. A
+ * compromised MCP client or runaway agent cannot spam the DJ voice channel.
+ * Limits: 5 admin actions per minute per process, burst of 3. Configure via
+ *   SUBWAVE_MCP_RATE_LIMIT   (default 5)
+ *   SUBWAVE_MCP_RATE_BURST   (default 3)
  */
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -29,6 +36,29 @@ const server = new McpServer({
   name: "subwave-mcp",
   version: "0.1.0",
 });
+
+// ─── Admin rate limiter (token bucket, per-process) ─────────────────────────
+//
+// MCP stdio servers are typically single-tenant (one agent → one process), so a
+// per-process limiter is the right granularity. The bucket refills at the
+// configured rate; a burst cap absorbs short spikes. Without this, a
+// compromised agent or prompt-injected agent could fire DJ segments
+// continuously, filling the broadcast with unwanted voice.
+const RATE_LIMIT = Math.max(1, Number(process.env.SUBWAVE_MCP_RATE_LIMIT ?? 5)); // tokens/min
+const RATE_BURST = Math.max(1, Number(process.env.SUBWAVE_MCP_RATE_BURST ?? 3)); // bucket size
+let tokens = RATE_BURST;
+let lastRefill = Date.now();
+
+function consumeToken(): boolean {
+  // Refill proportional to elapsed time
+  const now = Date.now();
+  const elapsedMin = (now - lastRefill) / 60_000;
+  tokens = Math.min(RATE_BURST, tokens + elapsedMin * RATE_LIMIT);
+  lastRefill = now;
+  if (tokens < 1) return false;
+  tokens -= 1;
+  return true;
+}
 
 /** Render any value as a text content block. */
 function text(value: unknown): { type: "text"; text: string } {
@@ -177,6 +207,16 @@ server.registerTool(
   },
   ({ message, mode, placement }) =>
     run(async () => {
+      if (!consumeToken()) {
+        return {
+          content: [text(
+            `Admin rate limit reached (${RATE_LIMIT}/min, burst ${RATE_BURST}). ` +
+            `Wait ~${Math.ceil(60 / RATE_LIMIT)}s and try again. ` +
+            `Tune with SUBWAVE_MCP_RATE_LIMIT / SUBWAVE_MCP_RATE_BURST env vars.`
+          )],
+          isError: true,
+        };
+      }
       const kind = placement === "over-track" ? "link" : "dj-speak";
       const result = await client.djSay(message, mode, kind);
       return {
@@ -208,6 +248,16 @@ server.registerTool(
   },
   ({ type }) =>
     run(async () => {
+      if (!consumeToken()) {
+        return {
+          content: [text(
+            `Admin rate limit reached (${RATE_LIMIT}/min, burst ${RATE_BURST}). ` +
+            `Wait ~${Math.ceil(60 / RATE_LIMIT)}s and try again. ` +
+            `Tune with SUBWAVE_MCP_RATE_LIMIT / SUBWAVE_MCP_RATE_BURST env vars.`
+          )],
+          isError: true,
+        };
+      }
       const result = await client.djSegment(type);
       return {
         content: [text(`Fired '${result.type}' segment. On-air: "${result.spoken}"`)],

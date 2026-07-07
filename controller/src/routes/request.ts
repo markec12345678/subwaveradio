@@ -30,10 +30,19 @@ const shuffle = (arr) => [...arr].sort(() => Math.random() - 0.5);
 // but defangs attempts to smuggle directives to the DJ agent (the raw text is
 // posted verbatim as a session turn and aired as free-text patter). This is a
 // belt — the prompt framing still treats the text as data — not the only layer.
-function sanitizeRequestText(raw: string): string {
+//
+// Exported for the fuzzing test (scripts/prompt-injection-fuzz.test.ts) and the
+// upcoming admin "preview sanitization" affordance. The function is pure — no
+// side effects, no I/O — so exporting it adds no risk surface.
+export function sanitizeRequestText(raw: string): string {
   return String(raw ?? '')
-    // chat/template role + instruction tokens (Llama/Mistral/ChatML style)
-    .replace(/\[\/?INST\]|<<\/?SYS>>|<\|[^|>]*\|>/gi, ' ')
+    // chat/template role + instruction tokens (Llama/Mistral/ChatML style).
+    // [INST]/[/INST] = Llama; <<SYS>><</SYS>> = Mistral system block;
+    // <|...|> = ChatML role tokens (system, assistant, user, im_start, im_end, end).
+    // Also covers [SYSTEM]/[/SYSTEM]/[SYS] — common in custom prompt templates
+    // and the Alpaca/Vicuna fine-tune format. Not stripping these was a fuzzing
+    // finding (scripts/prompt-injection-fuzz.test.ts, case 6).
+    .replace(/\[\/?(?:INST|SYSTEM|SYS)\]|<<\/?SYS>>|<\|[^|>]*\|>/gi, ' ')
     // any HTML/XML-ish tag, e.g. <project_instructions> … </project_instructions>
     .replace(/<\/?[a-z][^>]*>/gi, ' ')
     // leading role markers that fake a new turn ("system:", "assistant:")
